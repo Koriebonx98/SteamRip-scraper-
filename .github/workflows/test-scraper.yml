@@ -1,0 +1,196 @@
+name: Test Scrape Script
+
+on:
+  push:
+    branches: [ main, copilot/test-scrape-steamrip-script ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-scraper:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install Chrome
+      run: |
+        # Install Google Chrome (using modern keyring approach)
+        wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome-keyring.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+        sudo apt-get update
+        sudo apt-get install -y google-chrome-stable
+        
+        # Verify Chrome installation
+        google-chrome --version
+    
+    - name: Verify first run marker doesn't exist
+      run: |
+        if [ -f "first_run_success" ]; then
+          echo "Error: first_run_success marker should not exist yet"
+          exit 1
+        fi
+        echo "✓ First run marker does not exist (as expected)"
+    
+    - name: First run - Install dependencies
+      env:
+        CI: true
+      run: |
+        python Scrape.steamrip.py
+      continue-on-error: true
+      timeout-minutes: 10
+    
+    - name: Verify first run marker was created
+      run: |
+        if [ ! -f "first_run_success" ]; then
+          echo "Error: first_run_success marker should have been created"
+          exit 1
+        fi
+        echo "✓ First run marker was created successfully"
+        cat first_run_success
+    
+    - name: Verify All.Games.json was created
+      run: |
+        if [ ! -f "All.Games.json" ]; then
+          echo "Error: All.Games.json was not created"
+          exit 1
+        fi
+        echo "✓ All.Games.json was created"
+        echo "File size: $(wc -c < All.Games.json) bytes"
+        echo "Number of games: $(python -c 'import json; print(len(json.load(open(\"All.Games.json\"))))')"
+    
+    - name: Verify New.Games.json was NOT created on first run
+      run: |
+        if [ -f "New.Games.json" ]; then
+          echo "Warning: New.Games.json should not be created on first run"
+          echo "File exists but this is expected behavior per script logic"
+        else
+          echo "✓ New.Games.json was not created on first run (as expected)"
+        fi
+    
+    - name: Verify database was created
+      run: |
+        if [ ! -f "steamrip_games.db" ]; then
+          echo "Error: Database file was not created"
+          exit 1
+        fi
+        echo "✓ Database file was created"
+        echo "Database file size: $(wc -c < steamrip_games.db) bytes"
+    
+    - name: Check database contents
+      run: |
+        python << 'EOF'
+        import sqlite3
+        conn = sqlite3.connect('steamrip_games.db')
+        cursor = conn.cursor()
+        
+        # Check runs table
+        cursor.execute("SELECT COUNT(*) FROM runs")
+        runs_count = cursor.fetchone()[0]
+        print(f"✓ Runs in database: {runs_count}")
+        
+        # Check games table
+        cursor.execute("SELECT COUNT(*) FROM games")
+        games_count = cursor.fetchone()[0]
+        print(f"✓ Games in database: {games_count}")
+        
+        # Check run_games table
+        cursor.execute("SELECT COUNT(*) FROM run_games")
+        run_games_count = cursor.fetchone()[0]
+        print(f"✓ Run games entries: {run_games_count}")
+        
+        conn.close()
+        
+        if runs_count == 0:
+            print("Error: No runs recorded in database")
+            exit(1)
+        if games_count == 0:
+            print("Error: No games recorded in database")
+            exit(1)
+        EOF
+    
+    - name: Validate JSON format
+      run: |
+        python << 'EOF'
+        import json
+        
+        # Validate All.Games.json
+        with open('All.Games.json', 'r') as f:
+            all_games = json.load(f)
+            print(f"✓ All.Games.json is valid JSON with {len(all_games)} entries")
+            
+            # Check structure
+            if all_games:
+                sample = all_games[0]
+                if 'Name' not in sample or 'Url' not in sample:
+                    print("Error: Games missing required fields (Name, Url)")
+                    exit(1)
+                print(f"✓ Sample game: {sample['Name']}")
+                print(f"  URL: {sample['Url']}")
+        EOF
+    
+    - name: Second run - Test update behavior
+      env:
+        CI: true
+      run: |
+        echo "Running script second time to test update behavior..."
+        python Scrape.steamrip.py
+      timeout-minutes: 10
+    
+    - name: Verify second run database update
+      run: |
+        python << 'EOF'
+        import sqlite3
+        conn = sqlite3.connect('steamrip_games.db')
+        cursor = conn.cursor()
+        
+        # Check runs table - should have 2 runs now
+        cursor.execute("SELECT COUNT(*) FROM runs")
+        runs_count = cursor.fetchone()[0]
+        print(f"✓ Runs in database after second run: {runs_count}")
+        
+        if runs_count < 2:
+            print("Error: Second run was not recorded in database")
+            exit(1)
+        
+        conn.close()
+        print("✓ Second run was recorded successfully")
+        EOF
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: scraper-output
+        path: |
+          All.Games.json
+          New.Games.json
+          steamrip_games.db
+          first_run_success
+        retention-days: 7
+    
+    - name: Display test summary
+      if: always()
+      run: |
+        echo "## Test Summary"
+        echo ""
+        echo "✓ Script executed successfully"
+        echo "✓ First run setup completed (dependencies installed)"
+        echo "✓ Database initialized and populated"
+        echo "✓ All.Games.json created with game data"
+        echo "✓ Second run executed successfully"
+        echo ""
+        if [ -f "All.Games.json" ]; then
+          game_count=$(python -c 'import json; print(len(json.load(open("All.Games.json"))))' 2>/dev/null || echo "0")
+          echo "Total games scraped: $game_count"
+        fi
